@@ -1,7 +1,7 @@
-use log::{error, info, warn};
-use std::{collections::HashMap, sync::{Arc, Mutex, mpsc::{self, Receiver, Sender}}, thread};
+use log::{error, info, trace, warn};
+use std::{collections::HashMap, sync::{Arc, Mutex, mpsc::{self, Receiver, Sender}}, thread, time::{Duration, Instant}};
 use tokio::time;
-use procfs::{process::Process, ProcError};
+use procfs::{ProcError, process::{MemoryMap, MemoryMapData, Process, Stat}};
 
 type Result<T> = std::result::Result<T, XError>;
 
@@ -36,19 +36,15 @@ async fn main() {
         monitor(rx, proc_set_clone);
     }); 
 
-    let printer = tokio::spawn(async move {
-        let mut interval = time::interval(time::Duration::from_millis(1000));
-        for _ in 0..10 {
-            interval.tick().await;
-            //print_data(&proc_set);
-            tx_clone.send(MonitorOp::Measure).unwrap();
-        }
-    });
     
-    let children = (0..5).map(|_| {
+    let mut children = Vec::new();
+    let mut interval = time::interval(time::Duration::from_millis(2000));
+    for _ in (0..5) {
         let tx_clone = tx.clone();
-        tokio::spawn( async move {
-            let mut child = tokio::process::Command::new("sleep")
+        let new_child = tokio::spawn( async move {
+            let mut child = tokio::process::Command::new("target/debug/sleeper")
+                .arg("100")
+                .arg("1")
                 .arg("10")
                 .spawn()
                 .unwrap();
@@ -58,124 +54,151 @@ async fn main() {
                 tx_clone.send(MonitorOp::RemovePid(pid)).unwrap();
             };
 
-        })
+        });
+        children.push(new_child);
+        interval.tick().await;
+    }
+
+    let printer = tokio::spawn(async move {
+        let mut interval = time::interval(time::Duration::from_millis(1000));
+        loop {
+            interval.tick().await;
+            //print_data(&proc_set);
+            tx_clone.send(MonitorOp::Measure).unwrap();
+        }
     });
-    let _ = tokio::join!(printer, futures::future::join_all(children));
+    let _ = tokio::select! {
+        _ = printer => {
+            info!("Printer exited!"); 
+        } 
+        _ = futures::future::join_all(children) => {
+            info!("All children exited!"); 
+            
+        }
+    };
 }
 
-fn print_data(data: &Arc<Mutex<ProcessSet>>) {
-    let ps_clone: ProcessSet = data.lock().unwrap().clone();
-    info!("{:#?}", ps_clone);
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PidData {
     rss: u64,
+    shared_clean: Option<u64>,
+    shared_dirty: Option<u64>,
+    private_clean: Option<u64>,
+    private_dirty: Option<u64>,
     proc: Process,
+    smaps_stale_time: Duration,
+    smaps_last_refresh: Instant,
+    smaps: Option<Vec<(MemoryMap, MemoryMapData)>>,
+
+    stat: Option<Stat>,
+    stat_stale_time: Duration,
+    stat_last_refresh: Instant,
 }
 
 impl PidData {
     fn new(pid: u32) -> Result<Self> {
         Ok(PidData { 
             rss: 0,
+            shared_clean: None,
+            shared_dirty: None,
+            private_clean: None,
+            private_dirty: None,
             proc: Process::new(pid as i32)?,
+            smaps_stale_time: Duration::from_millis(1000),
+            smaps_last_refresh: Instant::now(),
+            smaps: None,
+
+            stat_stale_time: Duration::from_millis(500),
+            stat_last_refresh: Instant::now(),
+            stat: None,
         })
     }
 
-    fn get_shared_page_total(&mut self) -> Result<usize> {
+    fn get_meminfo(&mut self) -> Result<MemoryUsage> {
+        if self.stat_stale() {
+            self.refresh_stat()?;
+        }
+
+        Ok(MemoryUsage { total_rss: 0 })        
+    }
+
+    fn stat_stale(&self) -> bool {
+        self.stat.is_none() || Instant::now().duration_since(self.stat_last_refresh) > self.stat_stale_time
+    }
+    
+    fn refresh_stat(&mut self) -> Result<()> {
+        if !self.proc.is_alive() {
+            Err(XError::Dead)?
+        }
+
+        let stat = self.proc.stat()?;
+        self.stat_last_refresh = Instant::now();
+        self.rss = stat.rss as u64;
+        self.stat = Some(stat);
+        Ok(())
+    }
+
+    fn refresh_smaps(&mut self) -> Result<()> {
         if !self.proc.is_alive() {
             Err(XError::Dead)?
         }
 
         let smaps = self.proc.smaps()?;
-        let mut total = 0;
-        let mut total_cnt = 0; 
-        
-        let mut shared_dirty = 0;
-        let mut shared_dirty_cnt = 0;
-        let mut shared_clean = 0;
-        let mut shared_clean_cnt = 0;
-        let mut private_dirty = 0;
-        let mut private_dirty_cnt = 0;
-        let mut private_clean = 0;
-        let mut private_clean_cnt = 0;
-        let mut total_rss = 0;
-        for (map, data) in smaps {
-            let mut page_type = String::new();
-            let size = map.address.1 - map.address.0;
-            total_cnt += 1;
-            total += size;
-            if let Some(rss) = data.map.get("Rss") {
-                total_rss += rss;
-            }
+        self.smaps_last_refresh = Instant::now();
+        self.smaps = Some(smaps);
+        self.shared_clean = Some(self.get_smaps_optional_data_point_sum("Shared_Clean")?);
+        self.shared_dirty = Some(self.get_smaps_optional_data_point_sum("Shared_Dirty")?);
+        self.private_clean = Some(self.get_smaps_optional_data_point_sum("Private_Clean")?);
+        self.private_dirty = Some(self.get_smaps_optional_data_point_sum("Private_Dirty")?);
+        Ok(())
+    }
 
-            if let Some(pd) = data.map.get("Private_Dirty") {
-                private_dirty_cnt += 1;
-                private_dirty += pd;
-                if *pd > 0 {
-                    page_type.push_str("|PD|");
-                }
-            }
+    fn smaps_stale(&self) -> bool {
+        self.smaps.is_none() || Instant::now().duration_since(self.smaps_last_refresh) > self.smaps_stale_time
+    }
 
-            if let Some(pc) = data.map.get("Private_Clean") {
-                private_clean_cnt += 1;
-                private_clean += pc;
-                if *pc > 0 {
-                    page_type.push_str("|PC|");
-                }
-            }
-
-            if let Some(sc) = data.map.get("Shared_Clean") {
-                shared_clean_cnt += 1;
-                shared_clean += sc;
-                if *sc > 0 {
-                    page_type.push_str("|SC|");
-                }
-            }
-
-            if let Some(sd) = data.map.get("Shared_Dirty") {
-                shared_dirty_cnt += 1;
-                shared_dirty += sd;
-                if *sd > 0 {
-                    page_type.push_str("|SD|");
-                }
-            }
-            info!("Page: {:?}\t\t\tsize: {} type: {} flags: {:?}", map.pathname, size, page_type, data.vm_flags);
-        
-            //info!("{:#?}", data);
+    fn get_smaps_optional_data_point_sum(&mut self, key: &str) -> Result<u64> { 
+        if self.smaps_stale() {
+            self.refresh_smaps()?;
         }
 
-        let stat = self.proc.stat()?;
-        info!("Stat Rss: {} smaps rss: {}", stat.rss, total_rss);
-        info!("PC: {} ({})", private_clean, private_clean_cnt);
-        info!("PD: {} ({})", private_dirty, private_dirty_cnt);
-        info!("SC: {} ({})", shared_clean, shared_clean_cnt);
-        info!("SD: {} ({})", shared_dirty, shared_dirty_cnt);
-        /*let baseline: u32 = smaps
-                            .into_iter()
-                            .map(|x|  {
-                                info!("{:#?}", x); 
-                                 x.1
-                            }) //extract MemoryMapData
-                            .filter(|m| m.vm_flags.is_some())
-                            .map(|f| {
-                                0
-                            })
-                            .sum(); */
+        let sm = self.smaps.as_ref().ok_or(XError::missing("Smaps missing"))?;
+        let psses: Vec<&u64> = sm.iter().filter_map(|(_, md)| md.map.get(key)).collect();
+        Ok(psses.iter().map(|x| *x).sum())
+    }
+
+    fn report_raw(&mut self) -> Result<usize> {
+        if self.stat_stale() {
+            trace!("Refreshing stat");
+            self.refresh_stat()?;
+        }
+        if self.smaps_stale() {
+            trace!("Refreshing smaps");
+            self.refresh_smaps()?;
+        }
+        let rss = self.get_smaps_optional_data_point_sum("Rss")?;
+        let pss = self.get_smaps_optional_data_point_sum("Pss")?;
+        info!("{}, Stat Rss, {}, smaps rss, {}, smaps pss, {}, privClean, {}, privDirty, {}, sharedClean, {}, sharedDirty, {}", 
+              self.proc.pid,
+              self.rss * 4096, 
+              rss,
+              pss, 
+              self.private_clean.ok_or(XError::missing("Missing data point"))?, 
+              self.private_dirty.ok_or(XError::missing("Missing data point"))?,
+              self.shared_clean.ok_or(XError::missing("Missing data point"))?, 
+              self.shared_dirty.ok_or(XError::missing("Missing data point"))?);
         Ok(0)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ProcessSet {
-    shared_base: Option<usize>,
     pids: HashMap<u32, PidData>,
 }
 
 impl ProcessSet {
     fn new() -> Self {
         ProcessSet { 
-            shared_base: None,
             pids: HashMap::new(),
         }
     }
@@ -184,16 +207,17 @@ impl ProcessSet {
         match PidData::new(pid) {
             Ok(new) => {
                 self.pids.insert(pid, new); 
-                if self.shared_base.is_none() {
+                self.get_memory_usage();
+                /*if self.shared_base.is_none() {
                     match self.get_baseline() {
-                        Ok(b) => {
-                            self.shared_base = b;
+                        Ok(_) => {
                         }
                         Err(e) => {
                             error!("Failed to populate baseline! {:?}", e);
                         }
                     }
                 }
+                */
             }
             Err(e) => {
                 error!("Failed to add new pid! {:?}", e);
@@ -202,16 +226,13 @@ impl ProcessSet {
     }
 
     fn remove_pid(&mut self, pid: u32) {
-        self.pids.remove(&pid);
-        if self.pids.is_empty() {
-            self.shared_base = None;
-        }
+        self.pids.remove(&pid); 
     }
 
     fn get_baseline(&mut self) -> Result<Option<usize>> {
         let mut to_remove = Vec::new();
         for (pid, data) in self.pids.iter_mut() {
-            match data.get_shared_page_total() {
+            match data.report_raw() {
                 Ok(total) => {
                     return Ok(Some(total));
                 }
@@ -229,6 +250,37 @@ impl ProcessSet {
         }
         Ok(None)
     }
+
+    fn get_memory_usage(&mut self) -> Result<Vec<MemoryUsage>> {
+        let mut to_remove = Vec::new();
+        let mut results = Vec::new();
+        for (pid, data) in self.pids.iter_mut() {
+            data.report_raw()?;
+            /*
+            match data.get_meminfo() {
+                Ok(total) => {
+                    results.push(total);
+                }
+                Err(XError::Dead) => {
+                    warn!("Pid {} is not alive and will be removed", pid);
+                    to_remove.push(*pid);
+                }
+                Err(e) => {
+                    error!("Error reading page totals: {:?}", e);
+                }
+            }    
+            */
+        }
+        for pid in to_remove {
+            self.remove_pid(pid);
+        }
+        Ok(results)
+    }
+}
+
+#[derive(Debug)]
+struct MemoryUsage {
+    total_rss: u64,
 }
 
 
@@ -255,7 +307,10 @@ fn monitor(rx: Receiver<MonitorOp>, data: Arc<Mutex<ProcessSet>>) {
                 lock.remove_pid(pid);
             }
             Measure => {
-                info!("Running measurement");
+                //info!("Running measurement");
+                let mut lock = data.lock().unwrap();
+                let measurements = lock.get_memory_usage();
+                //info!("Measurement: {:?}", measurements);
             }
             Quit => {
                 info!("Monitor loop quiting");
