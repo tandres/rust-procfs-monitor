@@ -10,7 +10,7 @@ fn main() {
     let seconds_between_loops = args[2].parse::<u64>().unwrap();
     let pages = args[3].parse::<usize>().unwrap();
     for _ in 0..loops {
-        for _ in 0..pages {
+        if heap_eater.len() < pages {
             let array: Box<Vec<u8>> = Box::new(vec![1; 4096]); 
             heap_eater.push(array);
         }
