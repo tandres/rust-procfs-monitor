@@ -132,8 +132,8 @@ impl ProcessSet {
         };
 
         if refresh_baseline {
-            let new_now = Instant::now();
             self.update_baseline();
+            let new_now = Instant::now();
             trace!("Baseline refresh took: {} ms", new_now.duration_since(now).as_millis());
             self.baseline_last_update = Some(new_now);
             // Reset now for any stat update
@@ -141,8 +141,8 @@ impl ProcessSet {
         }
 
         if refresh_stat {
-            let new_now = Instant::now();
             self.update_stat();
+            let new_now = Instant::now();
             trace!("Stat refresh took: {} ms", new_now.duration_since(now).as_millis());
             self.stat_last_update = Some(new_now);
         }
@@ -302,6 +302,7 @@ impl ProcessSet {
     }
 
     fn get_actual_usage(&mut self) -> Result<MemoryUsage> {
+        let start = Instant::now();
         let proc_data: Vec<(u64, u64)> = self.pids.iter().filter_map(|(_key, proc)| {
             proc.smaps().ok()
         })
@@ -319,7 +320,7 @@ impl ProcessSet {
         } else {
             (0, Vec::new())
         };
-
+        trace!("Reading actual usage took {} ms", Instant::now().duration_since(start).as_millis());
         Ok(MemoryUsage {
             total_rss,
             rss_data,
