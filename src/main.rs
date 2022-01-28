@@ -1,5 +1,5 @@
 use log::{debug, error, info, trace, warn};
-use std::{collections::HashMap, sync::{Arc, Mutex, mpsc::{self, Receiver}}, thread, time::{Duration, Instant}};
+use std::{collections::HashMap, path::PathBuf, sync::{Arc, Mutex, mpsc::{self, Receiver}}, thread, time::{Duration, Instant}};
 use tokio::time;
 use procfs::{ProcError, process::{MemoryMap, MemoryMapData, Process}};
 
@@ -27,7 +27,20 @@ impl XError {
 async fn main() {
     pretty_env_logger::init();
 
-    let proc_set = Arc::new(Mutex::new(ProcessSet::new()));
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        println!("Arguments required! <executable> [args..]");
+        return;
+    }
+    let target = PathBuf::from(args.get(1).unwrap());
+    if !target.exists() || !target.is_file() {
+        println!("Argument is not a file!");
+        return;
+    }
+
+    let target_args = args[2..].to_vec();
+
+    let proc_set = Arc::new(Mutex::new(ProcessSet::new(60_000, 1_000)));
     let proc_set_clone = proc_set.clone();
     let (tx, rx) = mpsc::channel();
     let tx_clone = tx.clone();
@@ -39,11 +52,14 @@ async fn main() {
     let mut children = Vec::new();
     for _ in 0..5 {
         let tx_clone = tx.clone();
+        let target_clone = target.clone();
+        let args_clone = target_args.clone();
         let new_child = tokio::spawn( async move {
-            let mut child = tokio::process::Command::new("target/debug/sleeper")
-                .arg("100")
-                .arg("1")
-                .arg("10")
+            let mut child = tokio::process::Command::new(target_clone)
+                .args(args_clone)
+                //.arg("1000")
+                //.arg("1")
+                //.arg("10")
                 .spawn()
                 .unwrap();
             if let Some(pid) = child.id() {
@@ -57,7 +73,7 @@ async fn main() {
     }
 
     let printer = tokio::spawn(async move {
-        let mut interval = time::interval(time::Duration::from_millis(1000));
+        let mut interval = time::interval(time::Duration::from_millis(5000));
         loop {
             interval.tick().await;
             tx_clone.send(MonitorOp::Measure).unwrap();
@@ -90,7 +106,7 @@ struct ProcessSet {
 }
 
 impl ProcessSet {
-    fn new() -> Self {
+    fn new(baseline_ttl_ms: u64, stat_ttl_ms: u64) -> Self {
         let page_size = procfs::page_size().unwrap_or(4096) as u64;
         ProcessSet { 
             page_size,
@@ -98,8 +114,8 @@ impl ProcessSet {
             baseline_rss: None,
             baseline_shared_clean: 0,
             baseline_last_update: None,
-            baseline_ttl: Duration::from_millis(1_000),
-            stat_update_ttl: Duration::from_millis(1_000),
+            baseline_ttl: Duration::from_millis(baseline_ttl_ms),
+            stat_update_ttl: Duration::from_millis(stat_ttl_ms),
             stat_last_update: None,
             total_rss_est: 0,
             per_pid_rss: Vec::new(),
@@ -276,7 +292,7 @@ impl ProcessSet {
                 let adjusted_list = rss_list.iter().map(|(pid, rss)| {
                     let adjusted = rss.saturating_sub(shared_clean);
                     if adjusted == 0 {
-                        warn!("Rss value ({}) is below shared page ({}), pid {} will have 0 size", rss, shared_clean, pid);
+                        debug!("Rss value ({}) is below shared page ({}), pid {} will have 0 size", rss, shared_clean, pid);
                     }
                     adjusted
                 }).collect::<Vec<u64>>();

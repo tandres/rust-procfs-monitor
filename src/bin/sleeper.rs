@@ -9,10 +9,13 @@ fn main() {
     let loops = args[1].parse::<usize>().unwrap();
     let seconds_between_loops = args[2].parse::<u64>().unwrap();
     let pages = args[3].parse::<usize>().unwrap();
-    for _ in 0..loops {
-        if heap_eater.len() < pages {
+    for i in 0..loops {
+        if i < loops / 2 && heap_eater.len() < pages {
             let array: Box<Vec<u8>> = Box::new(vec![1; 4096]); 
             heap_eater.push(array);
+        }
+        else if i > loops / 2 && !heap_eater.is_empty() {
+            let _ = heap_eater.pop();
         }
         std::thread::sleep(std::time::Duration::from_secs(seconds_between_loops));
     }

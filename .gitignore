@@ -1,1 +1,4 @@
 /target
+build.sh
+load.sh
+run.sh
