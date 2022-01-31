@@ -106,6 +106,8 @@ struct ProcessSet {
 }
 
 impl ProcessSet {
+    const RSS_DIFF_PERCENT_REPORT_THRESHOLD: f32 = 5.0;
+     
     fn new(baseline_ttl_ms: u64, stat_ttl_ms: u64) -> Self {
         let page_size = procfs::page_size().unwrap_or(4096) as u64;
         ProcessSet { 
@@ -191,6 +193,8 @@ impl ProcessSet {
                     continue;
                 }
             };
+            // Todo: What about highly shared regions like glibc? We are getting dinged
+            // for them right now.
             match Self::smaps_sum_region_data(&regions, "Shared_Clean") {
                 Ok(shared_clean) => {
                     self.baseline_shared_clean = shared_clean;
@@ -237,10 +241,15 @@ impl ProcessSet {
                     // Stat rss is delivered in number of pages, everything else is in bytes
                     let stat_rss = (stat.rss as u64).saturating_mul(self.page_size);
                     new_rss.push((*key, stat_rss));
+                    // If we are looking at the baseline pid we want to get an idea if the stat
+                    // and smaps rss values are super far off.
                     if Some(key) == self.baseline_source.as_ref() {
                         if let Some(baseline_rss) = self.baseline_rss {
-                            let diff = stat_rss as i128 - baseline_rss as i128;
-                            debug!("Difference between baseline and stat rss: {} ({:3.2}%)", diff.abs(), 100.0 * diff.abs() as f32 / baseline_rss as f32);
+                            let diff = (stat_rss as f32 - baseline_rss as f32).abs();
+                            let diff_percent = 100.0 * diff as f32 / baseline_rss as f32;
+                            if diff_percent > Self::RSS_DIFF_PERCENT_REPORT_THRESHOLD {
+                                debug!("Difference between baseline and stat rss: {} ({:3.2}%)", diff, diff_percent);
+                            }
                         }
                     }
                 },
