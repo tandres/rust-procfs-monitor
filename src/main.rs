@@ -1,13 +1,9 @@
-use log::{debug, error, info, trace, warn};
-use std::{
-    path::PathBuf,
-    thread,
-};
+use log::info;
+use std::{path::PathBuf, thread};
 use tokio::time;
 
 mod process_set_monitor_linux;
 use process_set_monitor_linux as process_set_monitor;
-
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -24,7 +20,7 @@ async fn main() {
         return;
     }
 
-    let target_args = args[2..].to_vec(); 
+    let target_args = args[2..].to_vec();
 
     let mut monitor = process_set_monitor::ProcessSetMonitor::new(10_000, 1_000);
     let monitor_fn = monitor.start();
@@ -53,7 +49,8 @@ async fn main() {
         let mut interval = time::interval(time::Duration::from_millis(5000));
         loop {
             interval.tick().await;
-            monitor.report_set().await.unwrap();
+            let report = monitor.get_report().await.unwrap();
+            info!("Report: {:#?}", report);
         }
     });
     let _ = tokio::select! {
@@ -66,5 +63,3 @@ async fn main() {
         }
     };
 }
-
-

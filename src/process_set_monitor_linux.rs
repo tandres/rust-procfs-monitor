@@ -1,10 +1,13 @@
 use log::{debug, error, info, trace, warn};
-use procfs::{ProcError, process::{MemoryMap, MemoryMapData, Process, Stat}};
+use procfs::{
+    process::{MemoryMap, MemoryMapData, Process, Stat},
+    ProcError,
+};
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
         mpsc::{self, Sender},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -38,12 +41,12 @@ impl ProcessSetMonitorError {
 enum MonitorOp {
     AddPid(u32, oneshot::Sender<Result<u32>>),
     RemovePid(u32, oneshot::Sender<Result<u32>>),
-    ReportSet(oneshot::Sender<Result<ProcessSetMonitorReport>>),
+    GetReport(oneshot::Sender<Result<ProcessSetMonitorReport>>),
     Quit,
 }
 
 #[derive(Clone)]
-pub struct ProcessSetMonitor { 
+pub struct ProcessSetMonitor {
     smaps_cooldown_ms: u64,
     stat_cooldown_ms: u64,
     inner_sender: Option<Arc<Mutex<Sender<MonitorOp>>>>,
@@ -57,14 +60,14 @@ impl ProcessSetMonitor {
             inner_sender: None,
         }
     }
-    
+
     pub fn start(&mut self) -> impl Fn() {
         let (tx, rx) = mpsc::channel();
         self.inner_sender = Some(Arc::new(Mutex::new(tx)));
         let smaps_cooldown = self.smaps_cooldown_ms;
         let stat_cooldown = self.stat_cooldown_ms;
         move || {
-         //   let tx_clone = tx.clone();
+            //   let tx_clone = tx.clone();
             let mut inner = ProcessSetMonitorInner::new(smaps_cooldown, stat_cooldown);
             loop {
                 let msg = rx.recv().unwrap_or(MonitorOp::Quit);
@@ -78,11 +81,9 @@ impl ProcessSetMonitor {
                         info!("Removing pid {} from monitor", pid);
                         let _ = tx.send(inner.remove_pid(pid));
                     }
-                    ReportSet(tx) => {
+                    GetReport(tx) => {
                         info!("Generating Report");
-                        inner.get_actual_usage();
                         let _ = tx.send(inner.get_report());
-
                     }
                     Quit => {
                         info!("Monitor loop quiting");
@@ -94,20 +95,27 @@ impl ProcessSetMonitor {
     }
 
     pub async fn add_pid(&self, pid: u32) -> Result<u32> {
-        let inner_sender = self.inner_sender.as_ref().ok_or(ProcessSetMonitorError::NotStarted)?;
+        let inner_sender = self
+            .inner_sender
+            .as_ref()
+            .ok_or(ProcessSetMonitorError::NotStarted)?;
         let (tx, rx) = oneshot::channel();
         let op = MonitorOp::AddPid(pid, tx);
         {
             let _ = inner_sender.lock().unwrap().send(op);
         }
-        rx.await.map_err(|e: tokio::sync::oneshot::error::RecvError| {
-            error!("Receiver dropped unexpectedly: {:?}", e);
-            ProcessSetMonitorError::ThreadDead
-        })?
+        rx.await
+            .map_err(|e: tokio::sync::oneshot::error::RecvError| {
+                error!("Receiver dropped unexpectedly: {:?}", e);
+                ProcessSetMonitorError::ThreadDead
+            })?
     }
 
     pub async fn remove_pid(&self, pid: u32) -> Result<u32> {
-        let inner_sender = self.inner_sender.as_ref().ok_or(ProcessSetMonitorError::NotStarted)?;
+        let inner_sender = self
+            .inner_sender
+            .as_ref()
+            .ok_or(ProcessSetMonitorError::NotStarted)?;
         let (tx, rx) = oneshot::channel();
         let op = MonitorOp::RemovePid(pid, tx);
         {
@@ -119,10 +127,13 @@ impl ProcessSetMonitor {
         })?
     }
 
-    pub async fn report_set(&self) -> Result<ProcessSetMonitorReport> {
-        let inner_sender = self.inner_sender.as_ref().ok_or(ProcessSetMonitorError::NotStarted)?;
+    pub async fn get_report(&self) -> Result<ProcessSetMonitorReport> {
+        let inner_sender = self
+            .inner_sender
+            .as_ref()
+            .ok_or(ProcessSetMonitorError::NotStarted)?;
         let (tx, rx) = oneshot::channel();
-        let op = MonitorOp::ReportSet(tx);
+        let op = MonitorOp::GetReport(tx);
         {
             let _ = inner_sender.lock().unwrap().send(op);
         }
@@ -141,20 +152,6 @@ pub struct ProcessSetMonitorPerPidReport {
     pss_est: u32,
 }
 
-impl ProcessSetMonitorPerPidReport {
-    fn from_stat_and_baseline(inner: &InnerPidData, baseline: &BaselineMeasurement, set_count: usize) -> ProcessSetMonitorPerPidReport {
-        // rss_bytes() can only fail if procfs doesn't know the page size somehow
-        let rss_measured = inner.process.stat.rss_bytes().unwrap() as u32;
-        let pss_est = rss_measured.saturating_sub(baseline.shared_clean_bytes / set_count as u32);
-        ProcessSetMonitorPerPidReport {
-            pid: inner.process.pid as u32,
-            rss_measured,
-            cpu_percent: inner.cpu_perc,
-            pss_est,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct ProcessSetMonitorReport {
     total_rss_estimate: u64,
@@ -168,7 +165,6 @@ struct InnerPidData {
     stat: Stat,
     last_stat_read: Instant,
     cpu_perc: f32,
-    //rss: Option<u64>,
     baseline_last_update: Option<Instant>,
     baseline: BaselineMeasurement,
 }
@@ -198,8 +194,8 @@ impl InnerPidData {
 
 #[derive(Clone, Debug)]
 struct BaselineMeasurement {
-    // These fields are are delivered to us as u64s, however we don't anticipate,
-    // for these values, that such a large value is strictly necessary.
+    // These fields are are delivered to us as u64s, however we don't anticipate
+    // that such a large value is strictly necessary.
     shared_clean_bytes: u32,
     shared_dirty_bytes: u32,
     private_clean_bytes: u32,
@@ -231,7 +227,7 @@ impl From<&Vec<(MemoryMap, MemoryMapData)>> for BaselineMeasurement {
         let mut rss_bytes = 0;
         for (_, region) in data {
             let rmap = &region.map;
-            
+
             shared_clean_bytes += rmap.get("Shared_Clean").copied().unwrap_or(0) as u32;
             shared_dirty_bytes += rmap.get("Shared_Dirty").copied().unwrap_or(0) as u32;
             private_clean_bytes += rmap.get("Private_Clean").copied().unwrap_or(0) as u32;
@@ -300,7 +296,9 @@ impl ProcessSetMonitorInner {
         let mut now = Instant::now();
         // Check if our data needs to be updated
         let refresh_baseline = !self.pids.iter().any(|(_, p)| {
-            p.baseline_last_update.map(|time| now.duration_since(time) < self.baseline_ttl).unwrap_or(false)
+            p.baseline_last_update
+                .map(|time| now.duration_since(time) < self.baseline_ttl)
+                .unwrap_or(false)
         });
         let refresh_stat = match self.stat_last_update {
             Some(time) if now.duration_since(time) < self.stat_update_ttl => false,
@@ -319,7 +317,7 @@ impl ProcessSetMonitorInner {
         }
 
         if refresh_stat {
-            self.update_stat();
+            self.update_stat()?;
             let new_now = Instant::now();
             trace!(
                 "Stat refresh took: {} ms",
@@ -329,8 +327,8 @@ impl ProcessSetMonitorInner {
         }
         Ok(())
     }
-    
-    fn update_baseline(&mut self) -> Result<()> { 
+
+    fn update_baseline(&mut self) -> Result<()> {
         for (pid, data) in self.pids.iter_mut() {
             match data.process.smaps() {
                 Ok(smaps) => {
@@ -343,13 +341,15 @@ impl ProcessSetMonitorInner {
                 }
             }
         }
-        Err(ProcessSetMonitorError::missing("Unable to find living pid for baseline")) 
-    } 
+        Err(ProcessSetMonitorError::missing(
+            "Unable to find living pid for baseline",
+        ))
+    }
 
     fn update_stat(&mut self) -> Result<()> {
         let now = Instant::now();
         let ticks_per_second = procfs::ticks_per_second()?;
-        for (key, proc) in self.pids.iter_mut() {
+        for (_key, proc) in self.pids.iter_mut() {
             match proc.process.stat() {
                 Ok(stat) => {
                     // This is some debug code to watch to see if we get a really
@@ -377,7 +377,6 @@ impl ProcessSetMonitorInner {
                             );
                         }
                     }
-
                     // Get the old and up to date user+system time for this process
                     let cur_proc_usage = stat.utime + stat.stime;
                     let old_proc_usage = proc.stat.utime + proc.stat.stime;
@@ -385,9 +384,11 @@ impl ProcessSetMonitorInner {
                     // Determine how much that value has changed since the last update
                     // and turn it into a total cpu time
                     let proc_delta = cur_proc_usage - old_proc_usage;
-                    let proc_duration = Duration::from_millis((1000 * proc_delta) / ticks_per_second as u64);
+                    let proc_duration =
+                        Duration::from_millis((1000 * proc_delta) / ticks_per_second as u64);
                     let elapsed_time = now.duration_since(proc.last_stat_read);
-                    let cpu_perc = 100.0 * proc_duration.as_millis() as f32 / elapsed_time.as_millis() as f32;
+                    let cpu_perc =
+                        100.0 * proc_duration.as_millis() as f32 / elapsed_time.as_millis() as f32;
 
                     proc.stat = stat;
                     proc.cpu_perc = cpu_perc;
@@ -404,14 +405,19 @@ impl ProcessSetMonitorInner {
     fn add_pid(&mut self, pid: u32) -> Result<u32> {
         self.pids.insert(pid, InnerPidData::new(pid)?);
         // Set a delay on baseline update so we don't get bad baselines from measuring too early.
-        // Observations indicate that the majority of processes settle a little bit and if we 
+        // Observations indicate that the majority of processes settle a little bit and if we
         // establish a baseline too early it can throw off our readings. We will perform a refresh
         // on the first request of readings with data eventually reaching something matching reality.
         Ok(pid)
     }
 
     fn remove_pid(&mut self, pid: u32) -> Result<u32> {
-        self.pids.remove(&pid).ok_or(ProcessSetMonitorError::missing(format!("Remove requested for untracked pid {}", pid)))?;
+        self.pids
+            .remove(&pid)
+            .ok_or(ProcessSetMonitorError::missing(format!(
+                "Remove requested for untracked pid {}",
+                pid
+            )))?;
         if self.pids.is_empty() {
             self.reset();
         }
@@ -426,21 +432,39 @@ impl ProcessSetMonitorInner {
         let mut total_rss_estimate = 0;
         let mut total_pss_estimate = 0;
         let now = Instant::now();
-        let count = self.pids.len();
-        let baseline = self.pids.iter().find_map(|(_, data)| {
-            data.is_baseline_valid(&now, &self.baseline_ttl).then(|| data.baseline.clone())
-        }).ok_or(ProcessSetMonitorError::missing("Missing baseline"))?;
+        let baseline = self
+            .pids
+            .iter()
+            .find_map(|(_, data)| {
+                data.is_baseline_valid(&now, &self.baseline_ttl)
+                    .then(|| data.baseline.clone())
+            })
+            .ok_or(ProcessSetMonitorError::missing("Missing baseline"))?;
+        let shared_clean_discount = baseline.shared_clean_bytes
+            - baseline
+                .shared_clean_bytes
+                .checked_div(self.pids.len() as u32)
+                .unwrap_or(baseline.shared_clean_bytes);
+
         for (_, data) in self.pids.iter() {
-            let pid_report = ProcessSetMonitorPerPidReport::from_stat_and_baseline(&data, &baseline, count);
+            // rss_bytes() can only fail if procfs doesn't know the page size somehow
+            let rss_measured = data.stat.rss_bytes().unwrap() as u32;
+            let pss_est = rss_measured.saturating_sub(shared_clean_discount);
+            let pid_report = ProcessSetMonitorPerPidReport {
+                pid: data.process.pid as u32,
+                rss_measured,
+                cpu_percent: data.cpu_perc,
+                pss_est,
+            };
             total_pss_estimate += pid_report.pss_est as u64;
             total_rss_estimate += pid_report.rss_measured as u64;
             pid_reports.push(pid_report);
         }
-        
+
         Ok(ProcessSetMonitorReport {
             total_rss_estimate,
             total_pss_estimate,
-            pid_data: pid_reports
+            pid_data: pid_reports,
         })
     }
 
@@ -448,6 +472,7 @@ impl ProcessSetMonitorInner {
     // the reported values of the algorithm are accurate.
     //
     // WARNING: Smaps read take a really long time
+    #[allow(unused)]
     fn get_actual_usage(&mut self) {
         let start = Instant::now();
         let pss: Vec<u64> = self
@@ -466,9 +491,10 @@ impl ProcessSetMonitorInner {
             "Reading actual usage took {} ms",
             Instant::now().duration_since(start).as_millis()
         );
-        info!("Actual pss: {} [{:?}]", pss.iter().map(|x| *x).sum::<u64>(), pss);
+        info!(
+            "Actual pss: {} [{:?}]",
+            pss.iter().map(|x| *x).sum::<u64>(),
+            pss
+        );
     }
 }
-
-
-
